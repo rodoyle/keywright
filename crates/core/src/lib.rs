@@ -15,6 +15,7 @@ pub mod outcome;
 pub mod policy;
 pub mod refs;
 pub mod role;
+pub mod rotation;
 pub mod sops;
 pub mod trust;
 

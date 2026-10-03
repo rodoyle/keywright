@@ -17,6 +17,7 @@ use keywright_core::agestore::AgeIdentity;
 use keywright_core::approval::{ApprovalStore, OperationPlan};
 use keywright_core::datadir::DataDir;
 use keywright_core::inventory::Inventory;
+use keywright_core::lifecycle::RotationState;
 use keywright_core::material::{self, Store as MaterialStore};
 use keywright_core::outcome::{OperationId, OperationResult, Outcome};
 use keywright_core::policy::Policy;
@@ -65,6 +66,7 @@ pub struct BrokerState {
     pub inventory: Mutex<Inventory>,
     pub approvals: Mutex<ApprovalStore>,
     pub store: Mutex<MaterialStore>,
+    pub rotations: Mutex<keywright_core::rotation::RotationStore>,
     pub policy: Policy,
     pub delivery: keywright_core::kube_delivery::DeliveryConfig,
     age_identity: AgeIdentity,
@@ -89,11 +91,15 @@ impl BrokerState {
             ApprovalStore::load(&data_dir.root.join("approvals.json")).expect("approval store");
         let store =
             MaterialStore::load(&data_dir.root.join("material.json")).expect("material store");
+        let rotations =
+            keywright_core::rotation::RotationStore::load(&data_dir.root.join("rotations.json"))
+                .expect("rotation store");
         BrokerState {
             denylist: Mutex::new(IdentityDenylist::new()),
             inventory: Mutex::new(inventory),
             approvals: Mutex::new(approvals),
             store: Mutex::new(store),
+            rotations: Mutex::new(rotations),
             policy: config.policy.clone(),
             delivery: config.delivery.clone(),
             age_identity,
@@ -400,7 +406,16 @@ async fn admin_approve(
 
 /// Pending operations for a requester (agents can see what they're blocked
 /// on; this is metadata, not approval authority).
+/// rotation.status: metadata of active rotations.
 async fn rotation_status(
+    State(state): State<Arc<BrokerState>>,
+) -> Json<Vec<keywright_core::rotation::RotationRecord>> {
+    let rotations = state.rotations.lock().expect("rotations poisoned");
+    Json(rotations.active().into_iter().cloned().collect())
+}
+
+/// Pending approval operations (agents see what they are blocked on).
+async fn rotation_pending(
     State(state): State<Arc<BrokerState>>,
 ) -> Json<Vec<keywright_core::approval::PendingOp>> {
     let ops = state.approvals.lock().expect("approvals poisoned");
@@ -455,12 +470,248 @@ async fn admin_import(
     }
 }
 
-async fn rotation_abort() -> Json<OperationResult> {
+#[derive(Deserialize)]
+struct RotationPlanRequest {
+    credential: String,
+    idempotency_key: String,
+    #[serde(default)]
+    destinations: Vec<String>,
+}
+
+/// rotation.plan: durable PLANNED record bound to the current version;
+/// policy decides approval (auto or human PENDING).
+async fn rotation_plan(
+    State(state): State<Arc<BrokerState>>,
+    axum::Extension(identity): axum::Extension<PeerIdentity>,
+    Json(req): Json<RotationPlanRequest>,
+) -> Json<OperationResult> {
+    let (from_version, kind) = {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        match inv.get(&req.credential) {
+            Ok(c) => (c.version.0, c.kind),
+            Err(_) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Denied,
+                    operation: None,
+                    detail: Some("credential not found; ensure it first".into()),
+                });
+            }
+        }
+    };
+
+    let op_id = state.mint_op_id();
+    let record = {
+        let mut rotations = state.rotations.lock().expect("rotations poisoned");
+        match rotations.plan(
+            op_id.clone(),
+            &req.credential,
+            from_version,
+            req.destinations.clone(),
+            &req.idempotency_key,
+            &state.data_dir.root.join("rotations.json"),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Conflict,
+                    operation: None,
+                    detail: Some(e.to_string()),
+                });
+            }
+        }
+    };
+
+    let cred_ref = {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        inv.get(&req.credential).expect("checked above").clone()
+    };
+    let decision = state.policy.decide(
+        identity.role,
+        &cred_ref,
+        kind,
+        &req.destinations,
+        op_id.clone(),
+    );
+    match decision {
+        keywright_core::policy::Decision::AutoApproved { .. } => {
+            let mut rotations = state.rotations.lock().expect("rotations poisoned");
+            let _ = rotations.approve(&record.id.0, &state.data_dir.root.join("rotations.json"));
+            Json(OperationResult::ready())
+        }
+        keywright_core::policy::Decision::NeedsHumanApproval { operation } => {
+            Json(OperationResult::pending(operation))
+        }
+        keywright_core::policy::Decision::Denied { reason } => {
+            Json(OperationResult::denied(reason))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RotationExecuteRequest {
+    op: String,
+    idempotency_key: String,
+}
+
+/// rotation.execute: drive PREPARED → DEPLOYED with durable boundaries;
+/// verification is broker-controlled and separate, so without a configured
+/// check the rotation rests at DEPLOYED and never auto-verifies.
+async fn rotation_execute(
+    State(state): State<Arc<BrokerState>>,
+    Json(req): Json<RotationExecuteRequest>,
+) -> Json<OperationResult> {
+    let rot_path = state.data_dir.root.join("rotations.json");
+    let (credential, to_version, destinations) = {
+        let rotations = state.rotations.lock().expect("rotations poisoned");
+        match rotations.get(&req.op) {
+            Ok(r) => {
+                if r.idempotency_key != req.idempotency_key {
+                    return Json(OperationResult {
+                        outcome: Outcome::Conflict,
+                        operation: None,
+                        detail: Some("idempotency key mismatch".into()),
+                    });
+                }
+                (r.credential.clone(), r.to_version, r.destinations.clone())
+            }
+            Err(e) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Failed,
+                    operation: None,
+                    detail: Some(e.to_string()),
+                });
+            }
+        }
+    };
+    let kind = {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        match inv.get(&credential) {
+            Ok(c) => c.kind,
+            Err(_) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Failed,
+                    operation: None,
+                    detail: Some("credential vanished from inventory".into()),
+                });
+            }
+        }
+    };
+
+    // PREPARED: generate + persist replacement material for to_version.
+    let material = match kind {
+        CredentialKind::Password => material::generate_password(),
+        CredentialKind::KeyPair => material::generate_key_pair(),
+        CredentialKind::Token | CredentialKind::TlsPair => {
+            return Json(OperationResult {
+                outcome: Outcome::Failed,
+                operation: Some(OperationId::new(req.op.clone())),
+                detail: Some("token/tls rotation executes with certificate lifecycle (M6)".into()),
+            });
+        }
+    };
+    let material = match material {
+        Ok(m) => m,
+        Err(e) => {
+            return Json(OperationResult {
+                outcome: Outcome::Failed,
+                operation: Some(OperationId::new(req.op.clone())),
+                detail: Some(format!("generation failed: {e}")),
+            });
+        }
+    };
+    {
+        let mut store = state.store.lock().expect("material poisoned");
+        if let Err(e) = store.put(&credential, to_version, &material, &state.age_identity) {
+            return Json(OperationResult {
+                outcome: Outcome::Failed,
+                operation: Some(OperationId::new(req.op.clone())),
+                detail: Some(format!("persist replacement failed: {e}")),
+            });
+        }
+    }
+    // APPROVED: durable transition through the full state machine (the
+    // approval flag was set at plan time by policy or by human approve).
+    {
+        let mut rotations = state.rotations.lock().expect("rotations poisoned");
+        if let Err(e) = rotations.transition(&req.op, RotationState::Approved, &rot_path) {
+            return rotation_transition_failure(&req.op, e);
+        }
+    }
+    {
+        let mut rotations = state.rotations.lock().expect("rotations poisoned");
+        if let Err(e) = rotations.transition(&req.op, RotationState::Prepared, &rot_path) {
+            return rotation_transition_failure(&req.op, e);
+        }
+    }
+
+    // DEPLOYED: deliver replacement to mapped destinations.
+    if let Err((dest_name, e)) =
+        deliver_to_mapped(&state, &credential, kind, &destinations, &material).await
+    {
+        // Delivery failed: record the failure, old version stays live.
+        return Json(OperationResult {
+            outcome: Outcome::Failed,
+            operation: Some(OperationId::new(req.op.clone())),
+            detail: Some(format!("delivery to {dest_name} failed: {e}")),
+        });
+    }
+    {
+        let mut rotations = state.rotations.lock().expect("rotations poisoned");
+        if let Err(e) = rotations.transition(&req.op, RotationState::Deployed, &rot_path) {
+            return rotation_transition_failure(&req.op, e);
+        }
+    }
+
+    // Without a configured broker-controlled verification check, rest at
+    // DEPLOYED — never auto-verify, never auto-retire the old version.
     Json(OperationResult {
-        outcome: Outcome::Denied,
-        operation: None,
-        detail: Some("rotation abort arrives with the rotation engine (milestone 5)".into()),
+        outcome: Outcome::Ready,
+        operation: Some(OperationId::new(req.op.clone())),
+        detail: Some(
+            "DEPLOYED; awaiting broker-controlled verification \
+             (Kubernetes readiness alone is never proof)"
+                .into(),
+        ),
     })
+}
+
+fn rotation_transition_failure(
+    op: &str,
+    e: keywright_core::rotation::RotationError,
+) -> Json<OperationResult> {
+    Json(OperationResult {
+        outcome: Outcome::Conflict,
+        operation: Some(OperationId::new(op.to_string())),
+        detail: Some(e.to_string()),
+    })
+}
+
+#[derive(Deserialize)]
+struct RotationAbortRequest {
+    op: String,
+    reason: String,
+}
+
+/// rotation.abort: stop at the current boundary; the old credential stays
+/// live (never auto-revoked).
+async fn rotation_abort(
+    State(state): State<Arc<BrokerState>>,
+    Json(req): Json<RotationAbortRequest>,
+) -> Json<OperationResult> {
+    let rot_path = state.data_dir.root.join("rotations.json");
+    let mut rotations = state.rotations.lock().expect("rotations poisoned");
+    match rotations.abort(&req.op, &req.reason, &rot_path) {
+        Ok(r) => Json(OperationResult {
+            outcome: Outcome::Ready,
+            operation: Some(r.id.clone()),
+            detail: Some(format!("aborted at {}; old credential stays live", r.state)),
+        }),
+        Err(e) => Json(OperationResult {
+            outcome: Outcome::Failed,
+            operation: None,
+            detail: Some(e.to_string()),
+        }),
+    }
 }
 
 async fn certificate_inspect() -> Json<OperationResult> {
@@ -480,6 +731,9 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route("/credential/describe", get(credential_describe))
         .route("/credential/ensure", post(credential_ensure))
         .route("/rotation/status", get(rotation_status))
+        .route("/rotation/pending", get(rotation_pending))
+        .route("/rotation/plan", post(rotation_plan))
+        .route("/rotation/execute", post(rotation_execute))
         .route("/rotation/abort", post(rotation_abort))
         .route("/certificate/inspect", get(certificate_inspect))
         .route("/admin/approve", post(admin_approve))
@@ -528,6 +782,22 @@ pub async fn serve(
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
     let app = router(state.clone());
+
+    // Broker-internal renewal scheduler: runs without any agent session.
+    // Scans for expiring credentials daily and plans rotations through the
+    // same policy-gated engine (auto-approve or PENDING_APPROVAL records).
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+            loop {
+                interval.tick().await;
+                if let Err(e) = run_renewal_scan(&state) {
+                    eprintln!("keywright-broker: renewal scan failed: {e}");
+                }
+            }
+        });
+    }
 
     tokio::spawn(async move {
         loop {
@@ -579,6 +849,76 @@ fn is_loopback(ip: IpAddr) -> bool {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => v6.is_loopback(),
     }
+}
+
+/// Renewal window: plan rotations this many days before expiry.
+pub const RENEWAL_WINDOW_DAYS: u64 = 30;
+
+/// Pure scan: credential ids whose expiry falls inside the window.
+pub fn renewal_scan(inv: &Inventory, now_secs: u64, window_days: u64) -> Vec<String> {
+    let horizon = now_secs + window_days * 86_400;
+    inv.list()
+        .iter()
+        .filter_map(|c| c.expiry.map(|e| (c.id.clone(), e.not_after)))
+        .filter(|(_, not_after)| *not_after <= horizon)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// One scheduler pass: plan rotations (policy decides approval) for every
+/// credential inside the renewal window.
+pub fn run_renewal_scan(state: &BrokerState) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let due = {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        renewal_scan(&inv, now, RENEWAL_WINDOW_DAYS)
+    };
+    let rot_path = state.data_dir.root.join("rotations.json");
+    for id in due {
+        let mut rotations = state.rotations.lock().expect("rotations poisoned");
+        let (from_version, kind, existing_pending) = {
+            let inv = state.inventory.lock().expect("inventory poisoned");
+            let cred = inv.get(&id).map_err(|e| e.to_string())?;
+            let pending = rotations.active().iter().any(|r| r.credential == id);
+            (cred.version.0, cred.kind, pending)
+        };
+        if existing_pending {
+            continue; // already rotating; scan is idempotent
+        }
+        let op = state.mint_op_id();
+        let record = rotations
+            .plan(
+                op,
+                &id,
+                from_version,
+                vec![],
+                &format!("renewal-{now}-{id}"),
+                &rot_path,
+            )
+            .map_err(|e| e.to_string())?;
+        // Policy decides approval; without an auto-approve rule this lands
+        // as a pending rotation a human can approve — never silently skipped.
+        let cred_ref = {
+            let inv = state.inventory.lock().expect("inventory poisoned");
+            inv.get(&id).expect("present").clone()
+        };
+        let decision = state.policy.decide(
+            keywright_core::role::Role::Admin, // scheduler acts as an internal requester
+            &cred_ref,
+            kind,
+            &[],
+            record.id.clone(),
+        );
+        if let keywright_core::policy::Decision::AutoApproved { .. } = decision {
+            rotations
+                .approve(&record.id.0, &rot_path)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1192,6 +1532,184 @@ mod tests {
             resp.contains("kubeconfig"),
             "dependency report required: {resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn rotation_plan_execute_walks_durable_states() {
+        let broker = start_broker(policy_with("rustfs/*")).await;
+        // Provision a credential first (v1).
+        let body = r#"{"id":"rustfs/access-key","kind":"password","destinations":[]}"#;
+        request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/credential/ensure",
+            Some(body),
+        )
+        .await
+        .unwrap();
+
+        // Plan a rotation (policy auto-approves "rustfs/*").
+        let plan_body =
+            r#"{"credential":"rustfs/access-key","idempotency_key":"rot-1","destinations":[]}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/rotation/plan",
+            Some(plan_body),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("\"READY\""), "auto-approved rotation: {resp}");
+
+        // The op id is minted server-side; read it from rotation status.
+        let (_, status) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "GET",
+            "/rotation/status",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            status.contains("\"PLANNED\""),
+            "rotation recorded: {status}"
+        );
+        let op = extract_string(&status, "id");
+
+        // Execute: PREPARED → DEPLOYED (no mapped destinations to deliver to).
+        let exec_body = format!(r#"{{"op":"{op}","idempotency_key":"rot-1"}}"#);
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/rotation/execute",
+            Some(&exec_body),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("\"READY\""), "execute deploys: {resp}");
+        assert!(
+            resp.contains("DEPLOYED"),
+            "rests at DEPLOYED without verification config: {resp}"
+        );
+
+        // Stale idempotency key is refused.
+        let stale = format!(r#"{{"op":"{op}","idempotency_key":"wrong"}}"#);
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/rotation/execute",
+            Some(&stale),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.contains("\"CONFLICT\""),
+            "idempotency mismatch: {resp}"
+        );
+
+        // Abort: old credential stays live, no further phases.
+        let abort_body = format!(r#"{{"op":"{op}","reason":"test abort"}}"#);
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/rotation/abort",
+            Some(&abort_body),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("old credential stays live"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_rotation_is_a_conflict() {
+        let broker = start_broker(policy_with("rustfs/*")).await;
+        let body = r#"{"id":"rustfs/x","kind":"password","destinations":[]}"#;
+        request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/credential/ensure",
+            Some(body),
+        )
+        .await
+        .unwrap();
+        let plan_body = r#"{"credential":"rustfs/x","idempotency_key":"a","destinations":[]}"#;
+        let (_, first) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/rotation/plan",
+            Some(plan_body),
+        )
+        .await
+        .unwrap();
+        assert!(first.contains("\"READY\""), "{first}");
+
+        // A second concurrent rotation on the same credential: CONFLICT.
+        let plan_body2 = r#"{"credential":"rustfs/x","idempotency_key":"b","destinations":[]}"#;
+        let (_, second) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/rotation/plan",
+            Some(plan_body2),
+        )
+        .await
+        .unwrap();
+        assert!(
+            second.contains("\"CONFLICT\""),
+            "per-credential lock: {second}"
+        );
+        assert!(second.contains("active rotation"), "{second}");
+    }
+
+    fn extract_string(json: &str, field: &str) -> String {
+        // First occurrence of "<field>":"<value>" in a JSON array/object.
+        let needle = format!("\"{field}\":\"");
+        let start = json.find(&needle).expect("field present") + needle.len();
+        let end = json[start..].find('"').expect("closing quote") + start;
+        json[start..end].to_string()
+    }
+
+    #[test]
+    fn renewal_scan_finds_creds_inside_the_window() {
+        let mut inv = Inventory::new();
+        inv.record_request("a/expiring", CredentialKind::Password)
+            .unwrap();
+        inv.record_request("b/fresh", CredentialKind::Password)
+            .unwrap();
+        inv.record_request("c/no-expiry", CredentialKind::Password)
+            .unwrap();
+        let now = 1_000_000u64;
+        {
+            let c = inv.get_mut("a/expiring").unwrap();
+            c.expiry = Some(keywright_core::refs::Expiry::from_unix_seconds(
+                now + 5 * 86_400,
+            ));
+        }
+        {
+            let c = inv.get_mut("b/fresh").unwrap();
+            c.expiry = Some(keywright_core::refs::Expiry::from_unix_seconds(
+                now + 365 * 86_400,
+            ));
+        }
+        let due = renewal_scan(&inv, now, RENEWAL_WINDOW_DAYS);
+        assert_eq!(due, vec!["a/expiring".to_string()]);
     }
 
     fn policy_with(cred_pattern: &str) -> Policy {
