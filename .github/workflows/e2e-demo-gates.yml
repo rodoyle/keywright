@@ -1,0 +1,67 @@
+name: E2E demo gates
+
+# On-demand end-to-end test of the RELEASE build (not the debug CI build).
+# Runs the `#[ignore]`d demo gates in crates/broker/tests/demo_gates.rs
+# against a live cluster through the real HTTP surface with real client
+# certificates. Triggered manually with workflow_dispatch; not part of the
+# release publish path.
+#
+# Prereqs:
+#   - Repository secret KEYWRIGHT_KUBECONFIG containing the contents of a
+#     kubeconfig whose context can reach the homelab cluster and has access
+#     to namespaces keywright-demo-rustfs, keywright-demo-matrix, and
+#     keywright-demo-tls. (kube_delivery treats KEYWRIGHT_KUBECONFIG as a
+#     PATH; this job writes the secret to a temp file and points the env
+#     var at it.)
+#   - The runner must be able to reach that cluster's API server.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Tag or branch to test (default: the ref that triggered the
+          dispatch)
+        required: false
+        default: ''
+      runner:
+        description: 'Runner label — must be able to reach the homelab cluster'
+        required: false
+        default: 'ubuntu-latest'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  demo-gates:
+    name: end-to-end demo gates (release)
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-e2e
+      - name: Build (release, locked)
+        run: cargo build --workspace --release --locked
+      - name: Materialize kubeconfig
+        shell: bash
+        env:
+          KUBECONFIG_SECRET: ${{ secrets.KEYWRIGHT_KUBECONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KUBECONFIG_SECRET" ]; then
+            echo "::error::KEYWRIGHT_KUBECONFIG repository secret is not set" >&2
+            echo "::error::cannot reach the homelab cluster without it." >&2
+            exit 1
+          fi
+          cfg="$RUNNER_TEMP/keywright-kubeconfig"
+          printf '%s' "$KUBECONFIG_SECRET" > "$cfg"
+          chmod 600 "$cfg"
+          echo "KEYWRIGHT_KUBECONFIG=$cfg" >> "$GITHUB_ENV"
+      - name: Run demo gates (release, ignored)
+        run: |-
+          cargo test -p keywright-broker --release --locked \
+            --test demo_gates -- --ignored

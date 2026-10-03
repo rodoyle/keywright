@@ -1,0 +1,79 @@
+name: Release
+
+# Convention: CI (cargo clippy + cargo test on debug builds) runs in
+# ci.yml on push to main and PRs. A release is cut only AFTER CI is green,
+# by pushing a `v*` tag. This workflow builds the workspace in --release
+# (full optimized link; essential for the crypto paths), stages the three
+# installable binaries, and publishes them as a GitHub Release for the tag.
+# Clippy/cargo-test-on-debug is never the verification path for installed
+# artifacts; the on-demand e2e demo-gates workflow tests the release build
+# end to end separately.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: macos-latest
+            artifact: macos-arm64
+          - os: windows-latest
+            artifact: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.artifact }}
+      - name: Build (release, locked)
+        run: cargo build --workspace --release --locked
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          ext=""
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then ext=".exe"; fi
+          for bin in keywright keywright-broker keywright-mcp; do
+            dest="staging/${bin}-${{ matrix.artifact }}${ext}"
+            cp "target/release/${bin}${ext}" "$dest"
+          done
+          ls -la staging
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keywright-${{ matrix.artifact }}
+          path: staging/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: List staged assets
+        run: ls -la release-assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
