@@ -6,8 +6,12 @@ license.workspace = true
 description = "Keywright agent-facing MCP adapter (stdio) over the mTLS broker"
 
 [dependencies]
-keywright-core = { workspace = true }
+keywright-cli = { path = "../cli" }
+keywright-core = { path = "../core" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
 serde = { workspace = true }
+schemars = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
