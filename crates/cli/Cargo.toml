@@ -10,6 +10,8 @@ tempfile = { workspace = true }
 
 [dependencies]
 clap = { workspace = true }
+tokio = { workspace = true }
+tokio-openssl = { workspace = true }
 keywright-core = { workspace = true }
 openssl = { workspace = true }
 serde = { workspace = true }

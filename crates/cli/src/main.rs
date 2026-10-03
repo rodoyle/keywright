@@ -2,7 +2,7 @@
 //! approve/import. Privileged operations require a human at the keyboard.
 
 use clap::{Parser, Subcommand, ValueEnum};
-use keywright_cli::{DataDir, install, recover_server_cert};
+use keywright_cli::{CliError, DataDir, install, recover_server_cert};
 use keywright_core::role::Role;
 use std::path::PathBuf;
 
@@ -54,6 +54,30 @@ enum Command {
     },
     /// Reissue the broker server certificate (transport recovery).
     RecoverTransport,
+    /// Approve a pending operation (admin identity required).
+    Approve {
+        /// The operation id returned by the broker.
+        op: String,
+        /// Directory holding the enrolled admin client.pem/client.key.
+        #[arg(long, default_value = "./keywright-admin")]
+        client_dir: PathBuf,
+    },
+    /// Import a secret value for a credential (read from stdin — never
+    /// argv) and deliver it to the broker over mTLS.
+    Import {
+        /// Credential id to import material for.
+        #[arg(long)]
+        id: String,
+        /// Directory holding the enrolled admin client.pem/client.key.
+        #[arg(long, default_value = "./keywright-admin")]
+        client_dir: PathBuf,
+    },
+    /// List broker-managed credentials (metadata only).
+    List {
+        /// Directory holding an enrolled client.pem/client.key.
+        #[arg(long, default_value = "./keywright-admin")]
+        client_dir: PathBuf,
+    },
 }
 
 fn default_data_dir() -> PathBuf {
@@ -92,6 +116,21 @@ fn main() {
                 openssl_cert_not_after(&c.cert_pem)
             );
         }),
+        Command::Approve { op, client_dir } => with_broker_client(&dd, &client_dir, |client| {
+            keywright_cli::client::approve(client, &op)
+        })
+        .map_err(CliError::from),
+        Command::Import { id, client_dir } => {
+            println!("Paste the secret value, then press Enter (input is hidden from argv):");
+            with_broker_client(&dd, &client_dir, |client| {
+                keywright_cli::client::import_from_stdin(client, &id)
+            })
+            .map_err(CliError::from)
+        }
+        Command::List { client_dir } => {
+            with_broker_client(&dd, &client_dir, keywright_cli::client::list)
+                .map_err(CliError::from)
+        }
     };
     if let Err(e) = result {
         eprintln!("keywright: {e}");
@@ -104,4 +143,19 @@ fn openssl_cert_not_after(cert_pem: &str) -> String {
         Ok(cert) => cert.not_after().to_string(),
         Err(_) => "<unknown>".to_string(),
     }
+}
+
+/// Build a broker client from the installed layout and run one operation.
+fn with_broker_client(
+    dd: &keywright_cli::DataDir,
+    client_dir: &std::path::Path,
+    op: impl FnOnce(
+        &keywright_cli::client::BrokerClient,
+    ) -> Result<String, keywright_cli::client::ClientError>,
+) -> Result<(), keywright_cli::client::ClientError> {
+    let addr = keywright_cli::client::BrokerClient::addr_from_config(dd)?;
+    let client = keywright_cli::client::BrokerClient::from_dirs(dd, client_dir, addr)?;
+    let response = op(&client)?;
+    println!("{response}");
+    Ok(())
 }

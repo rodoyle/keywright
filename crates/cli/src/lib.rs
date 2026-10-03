@@ -13,6 +13,8 @@ use keywright_core::trust::{
 };
 use std::path::{Path, PathBuf};
 
+pub mod client;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error("io: {0}")]
@@ -29,6 +31,8 @@ pub enum CliError {
     NotInstalled(PathBuf),
     #[error("a file expected to exist is missing: {0}")]
     Missing(String),
+    #[error("broker client: {0}")]
+    Client(#[from] client::ClientError),
 }
 
 pub use keywright_core::datadir::DataDir;

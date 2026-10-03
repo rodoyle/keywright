@@ -5,8 +5,11 @@
 //! and invariants that the broker enforces.
 
 pub mod agestore;
+pub mod approval;
 pub mod datadir;
+pub mod inventory;
 pub mod lifecycle;
+pub mod material;
 pub mod outcome;
 pub mod policy;
 pub mod refs;
