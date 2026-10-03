@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Keywright human CLI: install, enroll, approve, import"
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [dependencies]
+clap = { workspace = true }
 keywright-core = { workspace = true }
 openssl = { workspace = true }
 serde = { workspace = true }

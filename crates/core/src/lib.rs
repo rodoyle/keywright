@@ -4,13 +4,17 @@
 //! Nothing in this crate performs privileged I/O; it defines the vocabulary
 //! and invariants that the broker enforces.
 
+pub mod agestore;
+pub mod datadir;
 pub mod lifecycle;
 pub mod outcome;
 pub mod policy;
 pub mod refs;
 pub mod role;
+pub mod trust;
 
 pub use lifecycle::{RotationState, TransitionError};
 pub use outcome::Outcome;
 pub use refs::{CredentialKind, CredentialRef, CredentialVersion, ProvisioningStatus};
 pub use role::Role;
+pub use trust::{CaMaterial, IdentityDenylist, IssuedCert, PeerIdentity};

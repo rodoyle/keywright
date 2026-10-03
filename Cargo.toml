@@ -15,9 +15,14 @@ k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
 kube = "4.2.0"
 openssl = { version = "0.10.81", features = ["vendored"] }
 tokio-openssl = "0.6.5"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"
+bytes = "1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+clap = { version = "4", features = ["derive"] }
 proptest = "1.11.0"
 tempfile = "3.27.0"
