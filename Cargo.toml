@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/broker", "crates/cli", "crates/mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+keywright-core = { path = "crates/core" }
+age = "0.12.1"
+axum = "0.8.9"
+k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
+kube = "4.2.0"
+openssl = { version = "0.10.81", features = ["vendored"] }
+tokio-openssl = "0.6.5"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+proptest = "1.11.0"
+tempfile = "3.27.0"

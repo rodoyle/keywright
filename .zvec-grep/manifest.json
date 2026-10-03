@@ -1,0 +1,25 @@
+{
+  "manifestVersion": 1,
+  "id": "9d912cc4-dbf2-48f7-bb99-a0c2d15c3fc1",
+  "name": "keywright",
+  "path": "C:\\Users\\rodoyle\\src\\keywright\\.zvec-grep",
+  "rootPaths": [
+    {
+      "absolutePath": "C:\\Users\\rodoyle\\src\\keywright",
+      "recursive": true
+    }
+  ],
+  "indexPolicy": "enabled",
+  "embedding": {
+    "provider": "local",
+    "model": "potion-code-16m-v2",
+    "dimension": 256,
+    "metric": "cosine"
+  },
+  "indexVersion": 1,
+  "createdTime": 1790992365921,
+  "updatedTime": 1790992372390,
+  "embeddingRuntime": {
+    "device": "auto"
+  }
+}

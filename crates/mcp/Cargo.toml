@@ -1,0 +1,16 @@
+[package]
+name = "keywright-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Keywright agent-facing MCP adapter (stdio) over the mTLS broker"
+
+[dependencies]
+keywright-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[[bin]]
+name = "keywright-mcp"
+path = "src/main.rs"

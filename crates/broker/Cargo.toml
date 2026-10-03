@@ -1,0 +1,26 @@
+[package]
+name = "keywright-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Keywright privileged broker server (mTLS HTTPS)"
+
+[dependencies]
+keywright-core = { workspace = true }
+age = { workspace = true }
+axum = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+openssl = { workspace = true }
+tokio = { workspace = true }
+tokio-openssl = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[[bin]]
+name = "keywright-broker"
+path = "src/main.rs"
