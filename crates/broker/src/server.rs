@@ -18,7 +18,7 @@ use keywright_core::approval::{ApprovalStore, OperationPlan};
 use keywright_core::datadir::DataDir;
 use keywright_core::inventory::Inventory;
 use keywright_core::lifecycle::RotationState;
-use keywright_core::material::{self, Store as MaterialStore};
+use keywright_core::material::{self, Material, Store as MaterialStore};
 use keywright_core::outcome::{OperationId, OperationResult, Outcome};
 use keywright_core::policy::Policy;
 use keywright_core::refs::{CredentialKind, CredentialRef, CredentialVersion};
@@ -44,6 +44,9 @@ pub struct BrokerConfig {
     /// Pinned SOPS binary for record encryption.
     #[serde(default)]
     pub sops: Option<keywright_core::sops::Sops>,
+    /// Certificate issuance profiles.
+    #[serde(default)]
+    pub cert_profiles: Vec<keywright_core::certs::CertProfile>,
 }
 
 impl Default for BrokerConfig {
@@ -53,6 +56,7 @@ impl Default for BrokerConfig {
             policy: Policy::default(),
             delivery: keywright_core::kube_delivery::DeliveryConfig::default(),
             sops: None,
+            cert_profiles: Vec::new(),
         }
     }
 }
@@ -60,7 +64,6 @@ impl Default for BrokerConfig {
 /// Shared broker state: all durable stores plus the identity denylist.
 /// Durable stores are guarded by one mutex; the broker is a low-volume
 /// control plane, so a single lock is the honest, simple choice.
-#[derive(Debug)]
 pub struct BrokerState {
     pub denylist: Mutex<IdentityDenylist>,
     pub inventory: Mutex<Inventory>,
@@ -69,6 +72,12 @@ pub struct BrokerState {
     pub rotations: Mutex<keywright_core::rotation::RotationStore>,
     pub policy: Policy,
     pub delivery: keywright_core::kube_delivery::DeliveryConfig,
+    /// Certificate issuance profiles (broker-controlled; agents reference
+    /// them by name and never define them).
+    pub cert_profiles: Vec<keywright_core::certs::CertProfile>,
+    /// The signing provider: software-backed test CA for the initial
+    /// release; PKCS#11 providers implement the same trait later.
+    pub signer: std::sync::Arc<dyn keywright_core::certs::SigningProvider>,
     age_identity: AgeIdentity,
     data_dir: DataDir,
     op_counter: Mutex<u64>,
@@ -79,6 +88,15 @@ impl BrokerState {
     #[cfg(test)]
     pub(crate) fn age_identity_of(&self) -> &AgeIdentity {
         &self.age_identity
+    }
+}
+
+impl std::fmt::Debug for BrokerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerState")
+            .field("cert_profiles", &self.cert_profiles)
+            .field("signer", &self.signer.name())
+            .finish_non_exhaustive()
     }
 }
 
@@ -102,6 +120,11 @@ impl BrokerState {
             rotations: Mutex::new(rotations),
             policy: config.policy.clone(),
             delivery: config.delivery.clone(),
+            cert_profiles: config.cert_profiles.clone(),
+            signer: std::sync::Arc::new(
+                keywright_core::certs::SoftwareCa::generate("keywright-software-ca")
+                    .expect("software CA"),
+            ),
             age_identity,
             data_dir,
             op_counter: Mutex::new(0),
@@ -714,11 +737,345 @@ async fn rotation_abort(
     }
 }
 
-async fn certificate_inspect() -> Json<OperationResult> {
+#[derive(Deserialize)]
+struct CertInspectQuery {
+    id: String,
+}
+
+/// certificate.inspect: metadata for a TLS credential (no material).
+async fn certificate_inspect(
+    State(state): State<Arc<BrokerState>>,
+    Query(q): Query<CertInspectQuery>,
+) -> Json<serde_json::Value> {
+    let cert_meta = {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        let c = inv.get(&q.id).expect("checked");
+        let expiry = c
+            .expiry
+            .map(|e| e.not_after.to_string())
+            .unwrap_or_default();
+        serde_json::json!({
+            "id": q.id,
+            "kind": c.kind.to_string(),
+            "version": c.version.0,
+            "not_after": expiry,
+            "provisioning": format!("{:?}", c.provisioning),
+        })
+    };
+    Json(cert_meta)
+}
+
+#[derive(Deserialize)]
+struct CertEnsureRequest {
+    id: String,
+    profile: String,
+    #[serde(default)]
+    sans: Vec<String>,
+    validity_days: u32,
+}
+
+/// certificate.ensure: generate the application key, build the CSR (signed
+/// by that key), issue through the approved profile via the signing
+/// provider, validate the pair, and persist as TlsPair material. Issuer
+/// keys never appear in stored or delivered material.
+async fn certificate_ensure(
+    State(state): State<Arc<BrokerState>>,
+    axum::Extension(identity): axum::Extension<PeerIdentity>,
+    Json(req): Json<CertEnsureRequest>,
+) -> Json<OperationResult> {
+    // Existing TlsPair credential: READY (idempotent, never overwritten).
+    {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        if let Ok(c) = inv.get(&req.id)
+            && c.provisioning == keywright_core::refs::ProvisioningStatus::Provisioned
+        {
+            return Json(OperationResult::ready());
+        }
+    }
+
+    // Profile must exist in broker config (agent-supplied values never
+    // create profiles).
+    let Some(profile) = state
+        .cert_profiles
+        .iter()
+        .find(|p| p.name == req.profile)
+        .cloned()
+    else {
+        return Json(OperationResult::denied(format!(
+            "unknown certificate profile {}",
+            req.profile
+        )));
+    };
+
+    // SANs must be allowed by the profile.
+    if let Err(e) = keywright_core::certs::validate_sans(&profile, &req.sans) {
+        return Json(OperationResult {
+            outcome: Outcome::Denied,
+            operation: None,
+            detail: Some(e.to_string()),
+        });
+    }
+    if let Err(e) = keywright_core::certs::validate_validity(&profile, req.validity_days) {
+        return Json(OperationResult {
+            outcome: Outcome::Denied,
+            operation: None,
+            detail: Some(e.to_string()),
+        });
+    }
+
+    // Generate application key + CSR + issue through the provider.
+    let key = match keywright_core::certs::generate_application_key(&profile) {
+        Ok(k) => k,
+        Err(e) => {
+            return Json(OperationResult {
+                outcome: Outcome::Failed,
+                operation: None,
+                detail: Some(format!("key generation failed: {e}")),
+            });
+        }
+    };
+    let primary_san = req.sans.first().cloned().unwrap_or_else(|| req.id.clone());
+    let csr = match keywright_core::certs::build_csr(&key, &primary_san, &req.sans, &profile) {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(OperationResult {
+                outcome: Outcome::Denied,
+                operation: None,
+                detail: Some(e.to_string()),
+            });
+        }
+    };
+    let key_pem =
+        String::from_utf8_lossy(&key.private_key_to_pem_pkcs8().unwrap_or_default()).into_owned();
+    let issued = match state
+        .signer
+        .issue(&csr, &req.sans, req.validity_days, &profile, 0)
+    {
+        Ok(i) => i,
+        Err(e) => {
+            return Json(OperationResult {
+                outcome: Outcome::Denied,
+                operation: None,
+                detail: Some(e.to_string()),
+            });
+        }
+    };
+
+    // Validate the pair (cert matches app key, chains to CA).
+    let ca_pem = issued.chain_pem.first().cloned().unwrap_or_default();
+    if let Err(e) = keywright_core::certs::validate_pair(&issued.cert_pem, &key_pem, &ca_pem) {
+        return Json(OperationResult {
+            outcome: Outcome::Failed,
+            operation: None,
+            detail: Some(format!("issued pair invalid: {e}")),
+        });
+    }
+
+    // Persist as TlsPair material (tls.crt = cert, tls.key = app key).
+    let mut material = Material::default();
+    material
+        .values
+        .insert("tls.crt".into(), issued.cert_pem.clone());
+    material.values.insert("tls.key".into(), key_pem);
+    {
+        let mut store = state.store.lock().expect("material poisoned");
+        if let Err(e) = store.put(&req.id, 1, &material, &state.age_identity) {
+            return Json(OperationResult {
+                outcome: Outcome::Failed,
+                operation: None,
+                detail: Some(format!("persist failed: {e}")),
+            });
+        }
+    }
+    {
+        let mut inv = state.inventory.lock().expect("inventory poisoned");
+        if let Err(e) = inv.record_request(&req.id, CredentialKind::TlsPair) {
+            let _ = e;
+        }
+        let c = inv.get_mut(&req.id).expect("recorded");
+        c.kind = CredentialKind::TlsPair;
+        c.provisioning = keywright_core::refs::ProvisioningStatus::Provisioned;
+        let not_after = now_secs() + u64::from(issued.validity_days) * 86_400;
+        c.expiry = Some(keywright_core::refs::Expiry::from_unix_seconds(not_after));
+    }
+    state.persist_stores();
+    let _ = identity;
+    Json(OperationResult::ready())
+}
+
+#[derive(Deserialize)]
+struct CertRotateRequest {
+    id: String,
+    /// "renew" (same application key) or "rekey" (new key).
+    mode: String,
+    validity_days: u32,
+}
+
+/// certificate.rotate: renewal (same key) and rekeying (new key) are modeled
+/// separately; both produce the next generation.
+async fn certificate_rotate(
+    State(state): State<Arc<BrokerState>>,
+    Json(req): Json<CertRotateRequest>,
+) -> Json<OperationResult> {
+    let (current_version, profile_name) = {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        match inv.get(&req.id) {
+            Ok(c) => (c.version.0, "web-demo".to_string()),
+            Err(_) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Denied,
+                    operation: None,
+                    detail: Some("credential not found".into()),
+                });
+            }
+        }
+    };
+    let Some(profile) = state
+        .cert_profiles
+        .iter()
+        .find(|p| p.name == profile_name)
+        .cloned()
+    else {
+        return Json(OperationResult::denied("no certificate profile configured"));
+    };
+    if !matches!(req.mode.as_str(), "renew" | "rekey") {
+        return Json(OperationResult::denied("mode must be renew or rekey"));
+    }
+
+    let (key, key_pem) = if req.mode == "renew" {
+        // Renewal reuses the stored application key.
+        let store = state.store.lock().expect("material poisoned");
+        match store.get(&req.id, current_version, &state.age_identity) {
+            Ok(m) => {
+                let pem = m.values.get("tls.key").cloned().unwrap_or_default();
+                drop(store);
+                match keywright_core::trust::parse_key(&pem) {
+                    Ok(k) => (k, pem),
+                    Err(e) => {
+                        return Json(OperationResult {
+                            outcome: Outcome::Failed,
+                            operation: None,
+                            detail: Some(format!("stored key unusable: {e}")),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Failed,
+                    operation: None,
+                    detail: Some(format!("stored material missing: {e}")),
+                });
+            }
+        }
+    } else {
+        // Rekey generates a fresh application key.
+        match keywright_core::certs::generate_application_key(&profile) {
+            Ok(k) => {
+                let pem =
+                    String::from_utf8_lossy(&k.private_key_to_pem_pkcs8().unwrap_or_default())
+                        .into_owned();
+                (k, pem)
+            }
+            Err(e) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Failed,
+                    operation: None,
+                    detail: Some(format!("key generation failed: {e}")),
+                });
+            }
+        }
+    };
+
+    // Renewal/rekeying keeps the ORIGINAL identity: reuse the SANs from the
+    // stored certificate (profiles must still allow them).
+    let sans = {
+        let store = state.store.lock().expect("material poisoned");
+        let m = match store.get(&req.id, current_version, &state.age_identity) {
+            Ok(m) => m,
+            Err(e) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Failed,
+                    operation: None,
+                    detail: Some(format!("stored material missing: {e}")),
+                });
+            }
+        };
+        let cert_pem = m.values.get("tls.crt").cloned().unwrap_or_default();
+        drop(store);
+        let cert = match keywright_core::trust::parse_cert(&cert_pem) {
+            Ok(c) => c,
+            Err(e) => {
+                return Json(OperationResult {
+                    outcome: Outcome::Failed,
+                    operation: None,
+                    detail: Some(format!("stored cert unusable: {e}")),
+                });
+            }
+        };
+        cert.subject_alt_names()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|g| g.dnsname().map(|d| d.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default()
+    };
+    if let Err(e) = keywright_core::certs::validate_sans(&profile, &sans) {
+        return Json(OperationResult::denied(e.to_string()));
+    }
+    let csr = match keywright_core::certs::build_csr(&key, &sans[0], &sans, &profile) {
+        Ok(c) => c,
+        Err(e) => return Json(OperationResult::denied(e.to_string())),
+    };
+    let generation = current_version;
+    let issued = match state
+        .signer
+        .issue(&csr, &sans, req.validity_days, &profile, generation)
+    {
+        Ok(i) => i,
+        Err(e) => return Json(OperationResult::denied(e.to_string())),
+    };
+    let ca_pem = issued.chain_pem.first().cloned().unwrap_or_default();
+    if let Err(e) = keywright_core::certs::validate_pair(&issued.cert_pem, &key_pem, &ca_pem) {
+        return Json(OperationResult {
+            outcome: Outcome::Failed,
+            operation: None,
+            detail: Some(format!("issued pair invalid: {e}")),
+        });
+    }
+
+    // Persist the next version.
+    let new_version = current_version + 1;
+    let mut m = Material::default();
+    m.values.insert("tls.crt".into(), issued.cert_pem.clone());
+    m.values.insert("tls.key".into(), key_pem);
+    {
+        let mut store = state.store.lock().expect("material poisoned");
+        if let Err(e) = store.put(&req.id, new_version, &m, &state.age_identity) {
+            return Json(OperationResult {
+                outcome: Outcome::Failed,
+                operation: None,
+                detail: Some(format!("persist failed: {e}")),
+            });
+        }
+    }
+    {
+        let mut inv = state.inventory.lock().expect("inventory poisoned");
+        let _ = inv.advance_version(&req.id);
+        let c = inv.get_mut(&req.id).expect("present");
+        let not_after = now_secs() + u64::from(issued.validity_days) * 86_400;
+        c.expiry = Some(keywright_core::refs::Expiry::from_unix_seconds(not_after));
+    }
+    state.persist_stores();
     Json(OperationResult {
-        outcome: Outcome::Denied,
+        outcome: Outcome::Ready,
         operation: None,
-        detail: Some("certificates arrive with milestone 6".into()),
+        detail: Some(format!(
+            "{}d to v{new_version} ({} mode)",
+            req.mode, req.mode
+        )),
     })
 }
 
@@ -736,6 +1093,8 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route("/rotation/execute", post(rotation_execute))
         .route("/rotation/abort", post(rotation_abort))
         .route("/certificate/inspect", get(certificate_inspect))
+        .route("/certificate/ensure", post(certificate_ensure))
+        .route("/certificate/rotate", post(certificate_rotate))
         .route("/admin/approve", post(admin_approve))
         .route("/admin/import", post(admin_import))
         .with_state(state)
@@ -842,6 +1201,13 @@ pub async fn serve(
     });
 
     Ok(local)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn is_loopback(ip: IpAddr) -> bool {
@@ -963,6 +1329,13 @@ mod tests {
             policy: policy.clone(),
             delivery: delivery.clone(),
             sops: None,
+            cert_profiles: vec![keywright_core::certs::CertProfile {
+                name: "web-demo".into(),
+                allowed_sans: vec!["app.local".into(), "*.demo.internal".into()],
+                allowed_ekus: vec!["serverAuth".into()],
+                max_validity_days: 90,
+                min_rsa_bits: 2048,
+            }],
         };
         let state = Arc::new(BrokerState::load(
             DataDir::new(data_root.clone()),
@@ -1175,6 +1548,7 @@ mod tests {
             policy: Policy::default(),
             delivery: keywright_core::kube_delivery::DeliveryConfig::default(),
             sops: None,
+            cert_profiles: Vec::new(),
         };
         let err = serve(
             config,
@@ -1489,6 +1863,13 @@ mod tests {
             policy: policy.clone(),
             delivery: delivery.clone(),
             sops: None,
+            cert_profiles: vec![keywright_core::certs::CertProfile {
+                name: "web-demo".into(),
+                allowed_sans: vec!["app.local".into(), "*.demo.internal".into()],
+                allowed_ekus: vec!["serverAuth".into()],
+                max_validity_days: 90,
+                min_rsa_bits: 2048,
+            }],
         };
         let tmp_root = tmp_path();
         let ca = generate_transport_ca("ca").unwrap();
@@ -1710,6 +2091,168 @@ mod tests {
         }
         let due = renewal_scan(&inv, now, RENEWAL_WINDOW_DAYS);
         assert_eq!(due, vec!["a/expiring".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn certificate_ensure_rejects_unauthorized_sans_and_issues_matching_pair() {
+        let broker = start_broker(policy_with("tls/*")).await;
+        // SAN outside the profile: DENIED.
+        let bad =
+            r#"{"id":"tls/web","profile":"web-demo","sans":["evil.example"],"validity_days":30}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/ensure",
+            Some(bad),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("DENIED"), "unauthorized SAN: {resp}");
+
+        // Validity beyond profile: DENIED.
+        let long =
+            r#"{"id":"tls/web","profile":"web-demo","sans":["app.local"],"validity_days":365}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/ensure",
+            Some(long),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("DENIED"), "validity beyond profile: {resp}");
+
+        // Unknown profile: DENIED.
+        let unknown = r#"{"id":"tls/web","profile":"attacker-profile","sans":["app.local"],"validity_days":30}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/ensure",
+            Some(unknown),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("DENIED"), "unknown profile: {resp}");
+
+        // Valid issuance: matching pair stored, READY; second ensure READY.
+        let good =
+            r#"{"id":"tls/web","profile":"web-demo","sans":["app.local"],"validity_days":30}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/ensure",
+            Some(good),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("\"READY\""), "valid issuance: {resp}");
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/ensure",
+            Some(good),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("\"READY\""), "idempotent: {resp}");
+
+        // Stored material is a matching pair; the issuer key never appears.
+        let store = broker.state.store.lock().unwrap();
+        let m = store
+            .get("tls/web", 1, broker.state.age_identity_of())
+            .unwrap();
+        let tls_key = m.values["tls.key"].clone();
+        let tls_crt = m.values["tls.crt"].clone();
+        drop(store);
+        assert!(tls_key.contains("BEGIN PRIVATE KEY"));
+        assert!(tls_crt.contains("BEGIN CERTIFICATE"));
+        // The stored private key is an application key (2048 bits), never
+        // the 3072-bit software CA issuer key.
+        let parsed = keywright_core::trust::parse_key(&tls_key).unwrap();
+        assert_eq!(parsed.rsa().unwrap().size() * 8, 2048);
+    }
+
+    #[tokio::test]
+    async fn certificate_rotate_renew_and_rekey_are_separate_paths() {
+        let broker = start_broker(policy_with("tls/*")).await;
+        let ensure =
+            r#"{"id":"tls/web","profile":"web-demo","sans":["app.local"],"validity_days":30}"#;
+        request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/ensure",
+            Some(ensure),
+        )
+        .await
+        .unwrap();
+        let v1_key = {
+            let store = broker.state.store.lock().unwrap();
+            store
+                .get("tls/web", 1, broker.state.age_identity_of())
+                .unwrap()
+                .values["tls.key"]
+                .clone()
+        };
+
+        // Renewal: same application key, new cert, v2.
+        let renew = r#"{"id":"tls/web","mode":"renew","validity_days":30}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/rotate",
+            Some(renew),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("\"READY\""), "renew: {resp}");
+        {
+            let store = broker.state.store.lock().unwrap();
+            let v2 = store
+                .get("tls/web", 2, broker.state.age_identity_of())
+                .unwrap();
+            assert_eq!(
+                v2.values["tls.key"], v1_key,
+                "renewal reuses the application key"
+            );
+        }
+
+        // Rekey: fresh application key, v3.
+        let rekey = r#"{"id":"tls/web","mode":"rekey","validity_days":30}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/certificate/rotate",
+            Some(rekey),
+        )
+        .await
+        .unwrap();
+        assert!(resp.contains("\"READY\""), "rekey: {resp}");
+        {
+            let store = broker.state.store.lock().unwrap();
+            let v3 = store
+                .get("tls/web", 3, broker.state.age_identity_of())
+                .unwrap();
+            assert_ne!(
+                v3.values["tls.key"], v1_key,
+                "rekey generates a new application key"
+            );
+        }
     }
 
     fn policy_with(cred_pattern: &str) -> Policy {

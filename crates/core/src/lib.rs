@@ -6,6 +6,7 @@
 
 pub mod agestore;
 pub mod approval;
+pub mod certs;
 pub mod datadir;
 pub mod inventory;
 pub mod kube_delivery;

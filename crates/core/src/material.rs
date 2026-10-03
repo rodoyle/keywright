@@ -35,7 +35,7 @@ pub enum MaterialError {
 
 /// Generated credential material, in memory, immediately after generation
 /// or decryption for delivery. Never serialize this to metadata surfaces.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Material {
     /// Key-name → value map matching the credential kind's required keys.
     pub values: BTreeMap<String, String>,
