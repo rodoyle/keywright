@@ -5,7 +5,9 @@ broker and wiring the MCP adapter into the agent's configuration.
 
 ## Prerequisites
 
-- A `keywright` CLI binary built from this workspace (`cargo build --workspace`).
+- A `keywright` CLI binary built from this workspace
+  (`cargo build --workspace --release`; installable binaries land in
+  `target/release/`).
 - A running keywright broker (see `docs/install.md` once written; today:
   `keywright install --dry-run --data-dir <dir>` then
   `keywright-broker --data-dir <dir>`).
@@ -68,6 +70,15 @@ In the Pi project settings (`.pi/settings.json`), add:
 
 The adapter speaks MCP over stdio and forwards every operation to the broker
 over mTLS loopback HTTPS using the enrolled agent certificate.
+
+`command` must point at the **release** binary — never a debug build:
+
+```sh
+install -m 0755 target/release/keywright-mcp /usr/local/bin/keywright-mcp
+```
+
+(`keywright` and `keywright-broker` are installed the same way when they are
+not left in `target/release/`.)
 
 ## 5. Agent workflow
 
