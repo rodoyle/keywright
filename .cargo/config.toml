@@ -1,0 +1,15 @@
+# Vendored OpenSSL (openssl = { features = ["vendored"] }) ships its object
+# files with CodeView references to ossl_static.pdb, but openssl-src installs
+# that PDB deep in its build tree (target/release/build/openssl-sys-*/out/
+# openssl-build/install/lib/) and never next to the .rlibs, so every release
+# link on Windows MSVC emits one LNK4099 per linked OpenSSL object:
+#
+#   warning LNK4099: PDB 'ossl_static.pdb' was not found with
+#   'libopenssl_sys-*.rlib(libcrypto-lib-ecdh_ossl.obj)' or at
+#   '...target\release\deps\ossl_static.pdb'; linking object as if no debug info
+#
+# We never debug into the vendored C sources, so silence exactly that one
+# warning. Scoping to target_env = "msvc" keeps GNU/MinGW and all non-Windows
+# targets (including the linux/macos release matrix) untouched.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/IGNORE:4099"]
