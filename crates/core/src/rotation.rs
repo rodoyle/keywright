@@ -251,6 +251,35 @@ impl RotationStore {
         Ok(())
     }
 
+    /// Reconcile credentials issued externally (e.g. human import) whose
+    /// material exists in the store but whose rotation record did not persist
+    /// through every boundary. Records a RECONCILED note binding the record
+    /// to the inventory's actual version — never assumes the phases ran.
+    pub fn reconcile_external(
+        &mut self,
+        credential: &str,
+        inventory_version: u32,
+        note: &str,
+        path: &Path,
+    ) -> Result<(), RotationError> {
+        // Find the active (or most recent) record for this credential.
+        let record_id = self
+            .records
+            .values()
+            .filter(|r| r.credential == credential)
+            .max_by_key(|r| r.created_at)
+            .map(|r| r.id.0.clone())
+            .ok_or_else(|| RotationError::NotFound(credential.to_string()))?;
+        let r = self.get_mut(&record_id)?;
+        r.notes.push(format!(
+            "RECONCILED external issuance: inventory at v{inventory_version} \
+             (record bound to v{}); {note}",
+            r.to_version
+        ));
+        drop(r);
+        self.save(path)
+    }
+
     /// Record revocation of the old version (after VERIFIED + overlap).
     pub fn record_revocation(
         &mut self,
@@ -441,6 +470,26 @@ mod tests {
         ));
         // The credential's version never advanced.
         assert_eq!(r.from_version, 1);
+    }
+
+    #[test]
+    fn external_issuance_reconciliation_is_recorded() {
+        let path = store_path();
+        let mut s = RotationStore::new();
+        s.plan(OperationId::new("op-x"), "i/j", 1, vec![], "k", &path)
+            .unwrap();
+        // Externally-issued material landed at v2 without the record
+        // persisting PREPARED; reconcile binds the record to reality.
+        s.reconcile_external("i/j", 2, "imported via trusted path", &path)
+            .unwrap();
+        let r = s.get("op-x").unwrap();
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("RECONCILED") && n.contains("v2")),
+            "reconciliation note missing: {:?}",
+            r.notes
+        );
     }
 
     #[test]
