@@ -4,5 +4,6 @@
 //! with mandatory mTLS on loopback by default, and enforces broker policy,
 //! approval, and destination pinning.
 
+pub mod delivery;
 pub mod server;
 pub mod tls;

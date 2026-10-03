@@ -91,7 +91,7 @@ fn run() -> Result<(), StartupError> {
         .map_err(|e| StartupError::Config(format!("broker.json: {e}")))?;
 
     let material = TransportMaterial::new(server_cert_pem, server_key_pem, ca_cert_pem);
-    let state = Arc::new(BrokerState::load(dd, config.policy.clone(), age_id));
+    let state = Arc::new(BrokerState::load(dd, &config, age_id));
     let runtime = tokio::runtime::Runtime::new()?;
     let addr = runtime.block_on(serve(config, material, state))?;
     println!("keywright-broker listening on {addr} (mTLS required)");

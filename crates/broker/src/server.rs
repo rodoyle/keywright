@@ -37,6 +37,12 @@ pub struct BrokerConfig {
     /// Auto-approval policy rules.
     #[serde(default)]
     pub policy: Policy,
+    /// Pinned delivery targets (clusters, namespaces, Secret mappings).
+    #[serde(default)]
+    pub delivery: keywright_core::kube_delivery::DeliveryConfig,
+    /// Pinned SOPS binary for record encryption.
+    #[serde(default)]
+    pub sops: Option<keywright_core::sops::Sops>,
 }
 
 impl Default for BrokerConfig {
@@ -44,6 +50,8 @@ impl Default for BrokerConfig {
         BrokerConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7870),
             policy: Policy::default(),
+            delivery: keywright_core::kube_delivery::DeliveryConfig::default(),
+            sops: None,
         }
     }
 }
@@ -58,6 +66,7 @@ pub struct BrokerState {
     pub approvals: Mutex<ApprovalStore>,
     pub store: Mutex<MaterialStore>,
     pub policy: Policy,
+    pub delivery: keywright_core::kube_delivery::DeliveryConfig,
     age_identity: AgeIdentity,
     data_dir: DataDir,
     op_counter: Mutex<u64>,
@@ -73,7 +82,7 @@ impl BrokerState {
 
 impl BrokerState {
     /// Build state from an installed data dir (loads or initializes stores).
-    pub fn load(data_dir: DataDir, policy: Policy, age_identity: AgeIdentity) -> Self {
+    pub fn load(data_dir: DataDir, config: &BrokerConfig, age_identity: AgeIdentity) -> Self {
         let inventory =
             Inventory::load(&data_dir.root.join("inventory.json")).expect("inventory store");
         let approvals =
@@ -85,7 +94,8 @@ impl BrokerState {
             inventory: Mutex::new(inventory),
             approvals: Mutex::new(approvals),
             store: Mutex::new(store),
-            policy,
+            policy: config.policy.clone(),
+            delivery: config.delivery.clone(),
             age_identity,
             data_dir,
             op_counter: Mutex::new(0),
@@ -188,6 +198,30 @@ struct EnsureRequest {
 /// credential.ensure: idempotent — never silently replace existing
 /// credentials. Missing credentials produce a provisioning path gated by
 /// policy; token kinds yield NEEDS_HUMAN_IMPORT.
+/// Deliver material to every destination that carries a pinned mapping.
+/// Unmapped names are skipped (policy-only references). Returns the first
+/// failing (destination, error) pair, if any.
+async fn deliver_to_mapped(
+    state: &BrokerState,
+    id: &str,
+    kind: CredentialKind,
+    destinations: &[String],
+    m: &material::Material,
+) -> Result<(), (String, String)> {
+    for dest_name in destinations {
+        let Ok(resolved) = state.delivery.resolve(dest_name, kind) else {
+            continue;
+        };
+        let secret = crate::delivery::core_delivery::build_generic_secret(&resolved, m)
+            .map_err(|e| (dest_name.clone(), e.to_string()))?;
+        let _ = id;
+        if let Err(e) = crate::delivery::deliver(&resolved, &secret).await {
+            return Err((dest_name.clone(), e.to_string()));
+        }
+    }
+    Ok(())
+}
+
 async fn credential_ensure(
     State(state): State<Arc<BrokerState>>,
     axum::Extension(identity): axum::Extension<PeerIdentity>,
@@ -195,8 +229,14 @@ async fn credential_ensure(
 ) -> Json<OperationResult> {
     // Only agent and admin roles reach here at all (mTLS required); both
     // may request provisioning, approval is a separate act.
-    let mut inv = state.inventory.lock().expect("inventory poisoned");
-    if let Ok(existing) = inv.get(&req.id) {
+    //
+    // Every store access lives in its own scoped block: no lock guard
+    // crosses an await point (mandatory for axum handlers).
+    let existing = {
+        let inv = state.inventory.lock().expect("inventory poisoned");
+        inv.get(&req.id).ok().cloned()
+    };
+    if let Some(existing) = existing {
         if existing.provisioning == keywright_core::refs::ProvisioningStatus::Provisioned {
             return Json(OperationResult::ready());
         }
@@ -214,9 +254,11 @@ async fn credential_ensure(
     // Token material cannot be generated: it must be issued by an external
     // service and imported by a human through the trusted input path.
     if req.kind == CredentialKind::Token {
-        inv.record_request(&req.id, req.kind).expect("record");
+        {
+            let mut inv = state.inventory.lock().expect("inventory poisoned");
+            inv.record_request(&req.id, req.kind).expect("record");
+        }
         let op = state.mint_op_id();
-        drop(inv);
         state.persist_stores();
         return Json(OperationResult {
             outcome: Outcome::NeedsHumanImport,
@@ -226,8 +268,11 @@ async fn credential_ensure(
     }
 
     // Broker-generatable kinds: evaluate policy first.
-    inv.record_request(&req.id, req.kind).expect("record");
-    let cred_ref = inv.get(&req.id).expect("recorded").clone();
+    let cred_ref = {
+        let mut inv = state.inventory.lock().expect("inventory poisoned");
+        inv.record_request(&req.id, req.kind).expect("record");
+        inv.get(&req.id).expect("recorded").clone()
+    };
     let op_id = state.mint_op_id();
     let decision = state.policy.decide(
         identity.role,
@@ -253,20 +298,42 @@ async fn credential_ensure(
                             detail: Some(format!("generated material invalid: {e}")),
                         });
                     }
-                    let mut store = state.store.lock().expect("material poisoned");
-                    let version = CredentialVersion::initial().0;
-                    if let Err(e) = store.put(&req.id, version, &m, &state.age_identity) {
+                    let persist = {
+                        let mut store = state.store.lock().expect("material poisoned");
+                        let version = CredentialVersion::initial().0;
+                        store.put(&req.id, version, &m, &state.age_identity)
+                    };
+                    if let Err(e) = persist {
                         return Json(OperationResult {
                             outcome: Outcome::Failed,
                             operation: Some(op_id),
                             detail: Some(format!("persist failed: {e}")),
                         });
                     }
-                    inv.mark_provisioned(&req.id).expect("recorded");
-                    drop(store);
-                    drop(inv);
+                    {
+                        let mut inv = state.inventory.lock().expect("inventory poisoned");
+                        inv.mark_provisioned(&req.id).expect("recorded");
+                    }
                     state.persist_stores();
                     let _ = rule; // audit trail: recorded in approvals below
+                    // Delivery: only for destinations that carry a pinned
+                    // mapping in broker config. Unmapped names remain policy
+                    // references (no silent cluster writes).
+                    if let Err((dest_name, e)) =
+                        deliver_to_mapped(&state, &req.id, req.kind, &req.destinations, &m).await
+                    {
+                        {
+                            let mut inv = state.inventory.lock().expect("inventory poisoned");
+                            inv.get_mut(&req.id).expect("recorded").provisioning =
+                                keywright_core::refs::ProvisioningStatus::DeliveryFailed;
+                        }
+                        state.persist_stores();
+                        return Json(OperationResult {
+                            outcome: Outcome::Failed,
+                            operation: Some(op_id),
+                            detail: Some(format!("delivery to {dest_name} failed: {e}")),
+                        });
+                    }
                     Json(OperationResult::ready())
                 }
                 Err(e) => Json(OperationResult {
@@ -277,19 +344,19 @@ async fn credential_ensure(
             }
         }
         keywright_core::policy::Decision::NeedsHumanApproval { operation } => {
-            let mut ops = state.approvals.lock().expect("approvals poisoned");
-            ops.record(
-                operation.clone(),
-                OperationPlan::Provision {
-                    credential: req.id.clone(),
-                    version: 1,
-                },
-                identity.role,
-                &identity.common_name,
-                false,
-            );
-            drop(ops);
-            drop(inv);
+            {
+                let mut ops = state.approvals.lock().expect("approvals poisoned");
+                ops.record(
+                    operation.clone(),
+                    OperationPlan::Provision {
+                        credential: req.id.clone(),
+                        version: 1,
+                    },
+                    identity.role,
+                    &identity.common_name,
+                    false,
+                );
+            }
             state.persist_stores();
             Json(OperationResult::pending(operation))
         }
@@ -542,6 +609,7 @@ mod tests {
     }
 
     async fn start_broker(policy: Policy) -> TestBroker {
+        let delivery = keywright_core::kube_delivery::DeliveryConfig::default();
         let data_root = tmp_path();
         let ca = generate_transport_ca("test-broker-ca").expect("ca");
         let server = issue_server_cert(&ca, &["localhost"]).expect("server cert");
@@ -550,9 +618,15 @@ mod tests {
             server.key_pem.clone(),
             ca.cert_pem.clone(),
         );
+        let config = BrokerConfig {
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            policy: policy.clone(),
+            delivery: delivery.clone(),
+            sops: None,
+        };
         let state = Arc::new(BrokerState::load(
             DataDir::new(data_root.clone()),
-            policy,
+            &config,
             AgeIdentity::generate(),
         ));
         let mut config = BrokerConfig::default();
@@ -759,13 +833,15 @@ mod tests {
         let config = BrokerConfig {
             bind: "0.0.0.0:7870".parse().unwrap(),
             policy: Policy::default(),
+            delivery: keywright_core::kube_delivery::DeliveryConfig::default(),
+            sops: None,
         };
         let err = serve(
             config,
             material,
             Arc::new(BrokerState::load(
                 DataDir::new(std::path::PathBuf::from("/nonexistent-must-not-be-touched")),
-                Policy::default(),
+                &BrokerConfig::default(),
                 AgeIdentity::generate(),
             )),
         )
@@ -1046,6 +1122,76 @@ mod tests {
         // Encrypted records: no plaintext values on disk.
         assert!(!material_file.contains("password"));
         assert!(!material_file.contains("values"));
+    }
+
+    #[tokio::test]
+    async fn mapped_but_unreachable_destination_fails_explicitly() {
+        // A mapped destination (pinned cluster + namespace) with a bogus
+        // kubeconfig: ensure must report FAILED with the delivery detail,
+        // never silently skip delivery.
+        let delivery = keywright_core::kube_delivery::DeliveryConfig {
+            clusters: vec![keywright_core::kube_delivery::ClusterMapping {
+                name: "homelab".into(),
+                kubeconfig: "/nonexistent/kubeconfig".into(),
+                namespaces: vec!["demo-ns".into()],
+            }],
+            destinations: vec![keywright_core::refs::Destination {
+                name: "demo-rustfs".into(),
+                cluster: "homelab".into(),
+                namespace: "demo-ns".into(),
+                secret: "rustfs-creds".into(),
+                key_names: None,
+            }],
+        };
+        let policy = policy_with("rustfs/*");
+        let config = BrokerConfig {
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            policy: policy.clone(),
+            delivery: delivery.clone(),
+            sops: None,
+        };
+        let tmp_root = tmp_path();
+        let ca = generate_transport_ca("ca").unwrap();
+        let server = issue_server_cert(&ca, &["localhost"]).unwrap();
+        let transport = TransportMaterial::new(
+            server.cert_pem.clone(),
+            server.key_pem.clone(),
+            ca.cert_pem.clone(),
+        );
+        let state = Arc::new(BrokerState::load(
+            DataDir::new(tmp_root),
+            &config,
+            AgeIdentity::generate(),
+        ));
+        let addr = serve(config.clone(), transport, state.clone())
+            .await
+            .unwrap();
+        let broker = TestBroker {
+            addr,
+            ca,
+            state,
+            data_root: std::path::PathBuf::new(),
+        };
+
+        let body = r#"{"id":"rustfs/pw","kind":"password","destinations":["demo-rustfs"]}"#;
+        let (_, resp) = request(
+            &broker,
+            Role::Agent,
+            "pi-agent-1",
+            "POST",
+            "/credential/ensure",
+            Some(body),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.contains("\"FAILED\""),
+            "unreachable delivery must FAIL: {resp}"
+        );
+        assert!(
+            resp.contains("kubeconfig"),
+            "dependency report required: {resp}"
+        );
     }
 
     fn policy_with(cred_pattern: &str) -> Policy {

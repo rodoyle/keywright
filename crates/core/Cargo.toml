@@ -7,6 +7,7 @@ description = "Keywright core: domain types, policy engine, rotation state machi
 
 [dependencies]
 age = { workspace = true }
+k8s-openapi = { workspace = true }
 openssl = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
