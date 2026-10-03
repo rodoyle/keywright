@@ -270,13 +270,14 @@ impl RotationStore {
             .max_by_key(|r| r.created_at)
             .map(|r| r.id.0.clone())
             .ok_or_else(|| RotationError::NotFound(credential.to_string()))?;
-        let r = self.get_mut(&record_id)?;
-        r.notes.push(format!(
-            "RECONCILED external issuance: inventory at v{inventory_version} \
-             (record bound to v{}); {note}",
-            r.to_version
-        ));
-        drop(r);
+        {
+            let r = self.get_mut(&record_id)?;
+            r.notes.push(format!(
+                "RECONCILED external issuance: inventory at v{inventory_version} \
+                 (record bound to v{}); {note}",
+                r.to_version
+            ));
+        }
         self.save(path)
     }
 
