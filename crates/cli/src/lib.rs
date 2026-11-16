@@ -249,7 +249,7 @@ fn apply_platform_hardening(data_dir: &DataDir) -> Result<(), CliError> {
         use std::os::unix::fs::PermissionsExt;
         // Restrict the data dir to the owner (the installer running as root
         // will chown to the keywright service account separately).
-        let mut perms = std::fs::metadata(&data_dir.root)?.permissions()?;
+        let mut perms = std::fs::metadata(&data_dir.root)?.permissions();
         perms.set_mode(0o700);
         std::fs::set_permissions(&data_dir.root, perms)?;
     }
